@@ -8,7 +8,12 @@ from flask import Flask, jsonify, request, render_template_string
 
 from imu_control import IMURehabSystem
 from muscle_allocator import MuscleAllocator
-from esp32motor import ESP32MotorBridge
+try:
+    # Name used on the deployed Raspberry Pi image.
+    from esp32motor import ESP32MotorBridge
+except ImportError:
+    # Public-repository name of the same USB-serial bridge module.
+    from esp32_motor_bridge import ESP32MotorBridge
 
 app = Flask(__name__)
 
