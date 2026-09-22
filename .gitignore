@@ -13,3 +13,17 @@ __pycache__/
 .arduino_build/
 tmp/
 ~$*.docx
+
+# Local archives, historical backups, and draft output (kept on this PC only)
+*.zip
+raspberry_pi_project_full_backup_*/
+recovery_backup_*/
+測試第一版/
+測試第二版/
+測試第三版/
+
+# Keep only the final NCKU biomedical engineering proposal in version control
+正式排版研究計畫/
+基於*.docx
+成大醫工研究計畫_最終修訂.docx
+checklist.docx
