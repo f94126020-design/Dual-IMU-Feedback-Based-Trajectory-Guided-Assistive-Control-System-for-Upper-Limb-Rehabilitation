@@ -1,0 +1,19 @@
+[Unit]
+Description=Upper-limb IMU and ESP32 Flask controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=user
+WorkingDirectory=/home/user/Desktop/imu_PIDcontrol
+ExecStart=/home/user/Desktop/.venv/bin/python /home/user/Desktop/imu_PIDcontrol/web_GUI_control.py
+Restart=always
+RestartSec=2
+TimeoutStopSec=3
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=append:/home/user/Desktop/imu_PIDcontrol/web_gui.log
+StandardError=append:/home/user/Desktop/imu_PIDcontrol/web_gui.log
+
+[Install]
+WantedBy=multi-user.target

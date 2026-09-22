@@ -1,0 +1,1001 @@
+import os
+import re
+import tempfile
+import types
+import unittest
+from unittest import mock
+
+import web_GUI_control as web
+
+
+class FakeSensor(types.SimpleNamespace):
+    def apply_rom_calibration(self, **mapping):
+        self.applied_rom_mapping = mapping
+
+
+class WebSafetyTests(unittest.TestCase):
+    def setUp(self):
+        web.rom_calibration.reset()
+        web.frequency_session.reset()
+        web.sensor = FakeSensor(motor_enabled=False, emergency_stop=False)
+        web.initialized = True
+        web.initializing = False
+        web.recording = False
+        web.latest_frame = None
+        web.csv_file = None
+        web.csv_writer = None
+        web.motor_bridge = None
+        web.motor_bridge_connected = False
+        web.motor_test_running = False
+        web.motor_arm_in_progress = False
+        web.motor_arm_session += 1
+        web.MOTOR_OUTPUT_SCALE[:] = list(web.MOTOR_OUTPUT_SCALE_DEFAULT)
+        web.CABLE_SETTINGS.clear()
+        web.CABLE_SETTINGS.update(web.CABLE_SETTINGS_DEFAULT)
+        web.muscle_allocator.antagonist_release_gain = 1.0
+        web.muscle_allocator.triceps_release_ratio = 0.5
+        web.muscle_allocator.biceps_release_ratio = 0.8
+        web.muscle_allocator.cable_return_gain = 1.0
+        web.muscle_allocator.cable_return_horizon = 1.25
+        web.muscle_allocator.cable_return_max_pwm = 60.0
+        web.muscle_allocator.shoulder_elbow_coupling_pwm = 50.0
+        web.muscle_allocator.shoulder_coupling_rewind_ratio = 1.0
+        web.muscle_allocator.wind_slew_rate = 1200.0
+        web.muscle_allocator.release_slew_rate = 2000.0
+        web.muscle_allocator.elbow_soft_landing_target = 90.0
+        web.muscle_allocator.elbow_soft_landing_zone = 25.0
+        web.muscle_allocator.elbow_soft_landing_min_ratio = 0.25
+        web.FOLLOWING_TRICEPS_WIND_LIMIT = 100.0
+        web.motor_jog_active = False
+        web.motor_jog_session += 1
+        web.motor_jog_last_heartbeat = 0.0
+        web.motor_channel_locks.update({
+            "biceps": False, "triceps": False, "deltoid": False,
+        })
+        web.imu_safety_fault_latched = False
+        web.imu_safety_fault_reason = ""
+        web.imu_safety_fault_time = None
+        web.imu_recovery_stable_samples = 0
+        web.imu_recovery_ready = False
+        web.imu_last_valid_angles = None
+        web.imu_channel_health_snapshot = {
+            "upper_arm": {"label": "上臂 IMU", "connected": True},
+            "forearm": {"label": "前臂 IMU", "connected": True},
+        }
+        web.muscle_allocator.reset_conditioner()
+        self.client = web.app.test_client()
+
+    def tearDown(self):
+        web.sensor = None
+        web.initialized = False
+        web.initializing = False
+        if web.recording:
+            self.client.post("/api/stop_recording", json={})
+        web.rom_calibration.reset()
+        web.frequency_session.reset()
+        web.motor_test_running = False
+        web.motor_jog_active = False
+        web.motor_jog_session += 1
+
+    def test_live_status_uses_compact_frame_payload(self):
+        web.latest_frame = {
+            "time": 1.25,
+            "measured_angle": 42.0,
+            "elbow_angle": 41.0,
+            "shoulder_angle": 12.0,
+            "target_angle": 45.0,
+            "reference_target_angle": 47.0,
+            "error": 3.0,
+            "elbow_roll_signed": 40.0,
+            "elbow_pitch_signed": 5.0,
+            "shoulder_angle_velocity": 2.0,
+            "target_joint": "elbow",
+            "controller_mode": "following_only",
+            "motion_state": "moving",
+            "elbow_following_state": "drive",
+            "shoulder_following_state": "idle",
+            "rom_limit_active": False,
+            "desired_pwm_biceps": 123,
+        }
+        response = self.client.get("/api/live_status")
+        self.assertEqual(response.status_code, 200)
+        frame = response.get_json()["frame"]
+        self.assertEqual(frame["measured_angle"], 42.0)
+        self.assertEqual(frame["reference_target_angle"], 47.0)
+        self.assertEqual(frame["elbow_following_state"], "drive")
+        self.assertNotIn("desired_pwm_biceps", frame)
+        analysis = self.client.get("/api/live_status?analysis=1")
+        self.assertEqual(analysis.status_code, 200)
+        analysis_frame = analysis.get_json()["frame"]
+        self.assertEqual(analysis_frame["desired_pwm_biceps"], 123.0)
+        self.assertEqual(analysis_frame["controller_mode"], "following_only")
+
+    def test_home_and_status_are_available(self):
+        home = self.client.get("/")
+        self.assertEqual(home.status_code, 200)
+        html = home.get_data(as_text=True)
+        self.assertIn('id="validationStageButton"', html)
+        self.assertIn('id="imuChannelStatus"', html)
+        self.assertIn("updateImuChannelStatus", html)
+        self.assertIn('id="validationApplyButton"', html)
+        self.assertIn("病患個人化活動範圍 ROM", html)
+        self.assertIn('id="romDurationInput"', html)
+        self.assertIn("自由重複", html)
+        self.assertIn("復健控制：跟隨實際動作", html)
+        self.assertIn("window.confirm", html)
+        self.assertIn("PID（IMU 跟隨＋落後補償）", html)
+        self.assertIn("開迴路軌跡展示（僅測試）", html)
+        self.assertIn("LADRC 自抗擾控制", html)
+        self.assertIn("間歇取樣跟隨（無目標、無補償）", html)
+        self.assertNotIn('<option value="assist">', html)
+        self.assertNotIn('<option value="continuous_assist">', html)
+        self.assertNotIn('<option value="feedforward_adrc">', html)
+        self.assertIn("ILC＋PID（週期學習）", html)
+        self.assertIn("ILC＋LADRC（週期學習）", html)
+        self.assertIn('id="trajectoryFixedPanel"', html)
+        self.assertIn('id="trajectorySinePanel"', html)
+        self.assertIn('id="trajectoryStepPanel"', html)
+        self.assertIn('id="pidParameterPanel"', html)
+        self.assertIn('id="kpInput" type="number" value="5"', html)
+        self.assertIn('id="feedforwardParameterPanel"', html)
+        self.assertIn('id="feedforwardMinInput" type="number" value="10"', html)
+        self.assertNotIn('id="feedforwardGainInput"', html)
+        self.assertIn("取樣後固定輸出 PWM", html)
+        self.assertIn("間歇取樣跟隨", html)
+        self.assertIn('id="adrcParameterPanel"', html)
+        self.assertIn('id="ilcParameterPanel"', html)
+        self.assertIn('id="demoParameterPanel"', html)
+        self.assertIn('id="demoOutputLimitInput" type="number" value="100"', html)
+        self.assertIn("showOnlyPanels('.controller-panel'", html)
+        self.assertIn("showOnlyPanels('.trajectory-panel'", html)
+        self.assertIn('id="actionToast"', html)
+        self.assertIn("button.button-busy", html)
+        self.assertIn("finishButtonAction", html)
+        self.assertIn("timeoutMs:10000", html)
+        self.assertIn("ARMING_WAIT", web.reader_loop.__code__.co_consts)
+        self.assertIn("document.addEventListener('click'", html)
+        self.assertIn('id="motorJogPwm"', html)
+        self.assertIn('id="motorScaleBiceps"', html)
+        self.assertIn('id="motorScaleTriceps"', html)
+        self.assertIn('id="motorScaleDeltoid"', html)
+        self.assertIn('id="cableTricepsReleasePercent"', html)
+        self.assertIn('id="cableBicepsReleasePercent"', html)
+        self.assertIn('id="cableShoulderRewindPercent"', html)
+        self.assertIn('id="elbowSoftLandingTarget"', html)
+        self.assertIn('id="elbowSoftLandingZone"', html)
+        self.assertIn('id="elbowSoftLandingMinPercent"', html)
+        self.assertIn("/api/cable_settings", html)
+        self.assertIn("/api/motor_output_scales", html)
+        self.assertIn('id="motorJogConfirmed"', html)
+        self.assertIn('id="imuSafetyLockStatus"', html)
+        self.assertIn('id="clearImuSafetyButton"', html)
+        self.assertIn("/api/imu_fault/clear", html)
+        self.assertIn('value="100"', html)
+        self.assertIn("startMotorJog(event,'biceps',1)", html)
+        self.assertIn("startMotorJog(event,'triceps',-1)", html)
+        self.assertIn("startMotorJog(event,'deltoid',1)", html)
+        self.assertIn("/api/motor_jog/heartbeat", html)
+        self.assertIn('id="motorJogLockBiceps"', html)
+        self.assertIn('id="motorJogLockTriceps"', html)
+        self.assertIn('id="motorJogLockDeltoid"', html)
+        self.assertIn("/api/motor_locks", html)
+        self.assertIn("安全鎖會停用該馬達的所有輸出", html)
+        self.assertIn('id="quickConditionInput"', html)
+        self.assertIn('id="outputLimitInput" type="number" value="55" min="0" max="255"', html)
+        self.assertIn('<option value="adrc">LADRC 跟隨＋自抗擾補償</option>', html)
+        self.assertIn('id="quickParameterSummary"', html)
+        self.assertNotIn('id="quickFollowingPwm"', html)
+        self.assertNotIn('id="quickPidParameters"', html)
+        self.assertNotIn('id="quickAdrcParameters"', html)
+        self.assertIn("快速測試將沿用主控制面板參數", html)
+        self.assertIn("倒數 3 秒期間馬達保持停止，歸零後才 ARM 並開始記錄", html)
+        self.assertIn("runQuickFullFlow", html)
+        self.assertIn("cancelQuickFullFlowOrTest", html)
+        self.assertIn("stopMotorAfterQuickRun", html)
+        self.assertIn("測試結束自動停止馬達", html)
+        self.assertIn("reference_target_angle??frame.target_angle", html)
+        self.assertIn(".live-card #motionState", html)
+        self.assertIn('id="quickDurationInput" type="number" value="20"', html)
+        self.assertIn('id="quickTestCanvas"', html)
+        self.assertIn('id="quickSignalCanvas"', html)
+        self.assertIn('id="quickCompareCanvas"', html)
+        self.assertIn('id="quickRunSelector"', html)
+        self.assertIn("function renderQuickRunSelector", html)
+        self.assertIn("function quickComparisonRuns", html)
+        self.assertIn("run.include_in_comparison=true", html)
+        self.assertIn("第 '+run.run_number+' 次", html)
+        self.assertIn("startQuickPresentationTest", html)
+        self.assertIn("downloadQuickTestPng", html)
+        self.assertIn("downloadQuickSignalsPng", html)
+        self.assertIn("downloadQuickTestCsv", html)
+        self.assertIn("drawQuickSignalResult", html)
+        self.assertIn("adrc_estimated_disturbance", html)
+        self.assertIn("ilc_current_cycle", html)
+        self.assertIn("quickTestActive?'/api/live_status?analysis=1'", html)
+        self.assertIn("RMSE", html)
+        quick_flow = html[
+            html.index("async function runQuickFullFlow"):
+            html.index("async function cancelQuickFullFlowOrTest")
+        ]
+        self.assertLess(
+            quick_flow.index("for(let count=3"),
+            quick_flow.index("JSON.stringify({enabled:true,confirmed:true})"),
+        )
+        self.assertIn('id="measuredAngle"', html)
+        self.assertIn('id="targetAngle"', html)
+        self.assertIn('id="errorValue"', html)
+        self.assertIn('id="elbowAngle"', html)
+        self.assertIn('id="shoulderAngle"', html)
+        self.assertIn('id="motionState"', html)
+        self.assertNotIn('id="desiredPwmBiceps"', html)
+        self.assertNotIn('id="desiredPwmTriceps"', html)
+        self.assertNotIn('id="desiredPwmDeltoid"', html)
+        self.assertNotIn('id="pwmBiceps"', html)
+        self.assertNotIn('id="pwmTriceps"', html)
+        self.assertNotIn('id="pwmDeltoid"', html)
+        self.assertNotIn('id="pidOutput"', html)
+        self.assertNotIn('id="adrcDisturbance"', html)
+        self.assertNotIn('id="ilcOutput"', html)
+        self.assertNotIn('id="serialDebugText"', html)
+        self.assertIn("禁止連接病患", html)
+        self.assertIn("系統識別與頻域分析", html)
+        self.assertIn("Chirp 掃頻", html)
+        self.assertIn("PRBS", html)
+        self.assertNotIn('<option value="p">', html)
+        self.assertNotIn('<option value="pi">', html)
+        self.assertNotIn("Servo Cmd", html)
+        self.assertIn("肘 90°－三頭肌伸展至打直", html)
+        self.assertIn("不要把上臂舉過頭", html)
+        self.assertIn('id="validationProtocol"', html)
+        self.assertIn('id="validationLiveAngles"', html)
+        self.assertIn('id="validationProgressBar"', html)
+        self.assertIn("按鍵已收到，正在確認目前 ROM 階段", html)
+        self.assertIn("statusMessageUntil", html)
+        self.assertIn("setLiveStatus(data.status)", html)
+        self.assertIn("const livePollDelayMs = 50", html)
+        self.assertIn("const slowUiIntervalMs = 500", html)
+        self.assertIn("const fullStatusPollDelayMs = 500", html)
+        self.assertIn("'/api/live_status'", html)
+        self.assertIn("setTimeout(pollStatus,document.hidden?1500:fullStatusPollDelayMs)", html)
+        self.assertIn("cache:'no-store'", html)
+        self.assertIn("const maxPoints = 160", html)
+        self.assertIn("requestAnimationFrame", html)
+        self.assertNotIn("setInterval(pollStatus", html)
+        self.assertIn("setInterval(motorJogHeartbeat,150)", html)
+        self.assertIn("fixed-estop", html)
+        self.assertIn("parameterStorageKey", html)
+        handlers = re.findall(r'on(?:click|change|pointerdown)="([A-Za-z_$][\w$]*)\(', html)
+        for handler in handlers:
+            self.assertRegex(html, rf"(?:async\s+)?function\s+{re.escape(handler)}\s*\(")
+        numeric_ids = re.findall(r'<input[^>]*id="([^"]+)"[^>]*type="number"', html)
+        for input_id in numeric_ids:
+            self.assertGreaterEqual(html.count(input_id), 2, input_id)
+        live = self.client.get("/api/live_status")
+        self.assertEqual(live.status_code, 200)
+        self.assertEqual(live.get_json(), {"ok": True, "frame": None})
+        response = self.client.get("/api/status")
+        self.assertEqual(response.status_code, 200)
+        status = response.get_json()
+        self.assertIn("rom_calibration", status)
+        self.assertIn("imu_health", status)
+        self.assertFalse(status["motor_arm_in_progress"])
+        self.assertFalse(status["motor_enabled"])
+        self.assertIn("motor_bridge_safety_state", status)
+        self.assertIn("channels", status["imu_health"])
+        self.assertIn("upper_arm", status["imu_health"]["channels"])
+        self.assertIn("forearm", status["imu_health"]["channels"])
+        self.assertIn("reconnect_count", status["imu_health"])
+        self.assertIn("transient_retry_count", status["imu_health"])
+        self.assertIn("reconnecting", status["imu_health"])
+        self.assertEqual(status["imu_health"]["hard_stall_timeout_seconds"], 15.0)
+        self.assertIn("frequency_identification", status)
+        self.assertNotIn("validation", status)
+        self.assertEqual(status["rom_calibration"]["mode"], "patient_rom")
+        self.assertEqual(status["motor_output"]["control_profile"], "three_muscle")
+        self.assertEqual(status["motor_output"]["pwm_limit"], 255)
+        self.assertEqual(status["motor_output"]["motor_min_pwm"], {"biceps": 0, "triceps": 0, "deltoid": 0})
+        self.assertEqual(status["motor_test"]["pwm"], 200)
+        self.assertEqual(status["motor_test"]["duration_seconds"], 0.5)
+        self.assertFalse(status["motor_jog"]["active"])
+        self.assertEqual(status["motor_jog"]["default_pwm"], 100)
+        self.assertEqual(status["motor_jog"]["max_pwm"], 200)
+        self.assertEqual(status["motor_jog"]["heartbeat_timeout_seconds"], 0.5)
+        self.assertEqual(status["motor_jog"]["locks"], {
+            "biceps": False, "triceps": False, "deltoid": False,
+        })
+        self.assertEqual(status["motor_locks"], {
+            "biceps": False, "triceps": False, "deltoid": False,
+        })
+        self.assertEqual(status["motor_output"]["antagonist_release_gain"], 1.0)
+        self.assertEqual(status["motor_output"]["triceps_release_ratio"], 0.5)
+        self.assertEqual(status["motor_output"]["biceps_release_ratio"], 0.8)
+        self.assertEqual(status["motor_output"]["cable_return_gain"], 1.0)
+        self.assertIn("virtual_cable_effort", status["motor_output"])
+        self.assertEqual(
+            status["motor_output"]["elbow_cable_balance"],
+            {
+                "biceps_release_extra_pwm": 0.0,
+                "triceps_release_extra_pwm": 0.0,
+            },
+        )
+        self.assertEqual(
+            status["motor_output"]["elbow_balance_horizon_seconds"], 1.25
+        )
+        self.assertEqual(
+            status["motor_output"]["elbow_balance_max_extra_pwm"], 60.0
+        )
+        self.assertEqual(status["motor_output"]["command_filter_tau"], 0.02)
+        self.assertEqual(status["motor_output"]["wind_slew_rate"], 1200.0)
+        self.assertEqual(status["motor_output"]["release_slew_rate"], 2000.0)
+        self.assertEqual(status["motor_output"]["reverse_deadtime"], 0.02)
+        self.assertTrue(status["motor_output"]["imu_following"])
+        self.assertEqual(status["motor_output"]["controller_modes"], ["pid", "adrc", "ilc_pid", "ilc_adrc", "following_only", "trajectory_demo"])
+        self.assertEqual(status["motor_output"]["feedforward_gain"], 0.0)
+        self.assertEqual(status["motor_output"]["feedforward_min_pwm"], 10.0)
+        self.assertEqual(status["motor_output"]["event_following"]["sample_duration_seconds"], 0.04)
+        self.assertEqual(status["motor_output"]["event_following"]["hold_duration_seconds"], 0.20)
+        self.assertEqual(status["motor_output"]["motor_direction_sign"]["biceps"], -1)
+        self.assertEqual(status["motor_output"]["motor_direction_sign"]["triceps"], 1)
+        self.assertEqual(status["motor_output"]["motor_output_scale"]["biceps"], 0.8)
+        self.assertEqual(status["motor_output"]["motor_output_scale"]["triceps"], 1.0)
+        self.assertEqual(status["motor_output"]["motor_output_scale"]["deltoid"], 1.0)
+        self.assertEqual(status["motor_output"]["event_following"]["blanking_duration_seconds"], 0.04)
+        self.assertEqual(status["motor_output"]["event_following"]["maximum_session_seconds"], 3.0)
+        self.assertEqual(status["motor_output"]["following_triceps_wind_limit"], 100)
+        self.assertEqual(
+            status["motor_output"]["shoulder_elbow_coupling"]["coupling_pwm"],
+            50.0,
+        )
+        self.assertTrue(status["motor_output"]["trajectory_demo"])
+        self.assertTrue(status["motor_output"]["adrc"])
+        self.assertTrue(status["motor_output"]["ilc"])
+        self.assertIn("ilc", status)
+        self.assertEqual(status["motor_output"]["demo_output_limit"], 100.0)
+        self.assertEqual(status["motor_output"]["shoulder_release_max_pwm"], 60.0)
+        self.assertTrue(status["motor_output"]["live_output_allowed"])
+        self.assertEqual(status["motor_output"]["mode"], "live_on_confirmation")
+        self.assertIn(
+            "document.getElementById('targetJointInput').disabled=false",
+            web.HTML_PAGE,
+        )
+        self.assertIn('id="followingJointInput"', web.HTML_PAGE)
+        self.assertIn("followingJointChooser').style.display=followingOnly?'block':'none'", web.HTML_PAGE)
+
+    def test_motor_enable_requires_explicit_confirmation(self):
+        response = self.client.post("/api/set_motor", json={"enabled": True})
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(response.get_json()["ok"])
+        self.assertFalse(web.sensor.motor_enabled)
+
+    def test_confirmed_motor_enable_arms_esp32_without_rom_gate(self):
+        bridge = mock.Mock()
+        web.motor_bridge = bridge
+        web.motor_bridge_connected = True
+        with mock.patch.object(web, "connect_motor_bridge_if_needed", return_value=True):
+            response = self.client.post(
+                "/api/set_motor", json={"enabled": True, "confirmed": True}
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["ok"])
+        self.assertTrue(web.sensor.motor_enabled)
+        self.assertFalse(web.motor_arm_in_progress)
+        bridge.prepare_active.assert_called_once_with(wait_timeout=1.5)
+
+    def test_duplicate_enable_is_rejected_while_arm_is_in_progress(self):
+        web.motor_arm_in_progress = True
+        response = self.client.post(
+            "/api/set_motor", json={"enabled": True, "confirmed": True}
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(response.get_json()["ok"])
+        self.assertFalse(web.sensor.motor_enabled)
+
+    def test_motor_test_requires_confirmation_and_disabled_control(self):
+        denied = self.client.post("/api/motor_test/pulse", json={
+            "motor": "triceps", "direction": 1,
+        })
+        self.assertEqual(denied.status_code, 403)
+        web.sensor.motor_enabled = True
+        blocked = self.client.post("/api/motor_test/pulse", json={
+            "motor": "triceps", "direction": 1, "confirmed_rig": True,
+        })
+        self.assertEqual(blocked.status_code, 409)
+
+    def test_motor_test_arms_then_dispatches_bounded_worker(self):
+        bridge = mock.Mock()
+        web.motor_bridge = bridge
+        web.motor_bridge_connected = True
+        with mock.patch.object(web, "connect_motor_bridge_if_needed", return_value=True), mock.patch.object(web.threading, "Thread") as thread_class:
+            response = self.client.post("/api/motor_test/pulse", json={
+                "motor": "deltoid", "direction": -1, "confirmed_rig": True,
+            })
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["ok"])
+        bridge.stop.assert_called_once()
+        bridge.arm.assert_called_once()
+        thread_class.return_value.start.assert_called_once()
+
+    def test_motor_jog_requires_confirmation_and_disabled_main_control(self):
+        denied = self.client.post("/api/motor_jog/start", json={
+            "motor": "biceps", "direction": 1, "pwm": 100,
+        })
+        self.assertEqual(denied.status_code, 403)
+        web.sensor.motor_enabled = True
+        blocked = self.client.post("/api/motor_jog/start", json={
+            "motor": "biceps", "direction": 1, "pwm": 100, "confirmed": True,
+        })
+        self.assertEqual(blocked.status_code, 409)
+
+    def test_motor_jog_is_available_before_imu_initialization(self):
+        bridge = mock.Mock(safety_state="IDLE")
+        web.sensor = None
+        web.initialized = False
+        web.motor_bridge = bridge
+        web.motor_bridge_connected = True
+        with mock.patch.object(web, "connect_motor_bridge_if_needed", return_value=True), mock.patch.object(web.threading, "Thread") as thread_class:
+            response = self.client.post("/api/motor_jog/start", json={
+                "motor": "biceps", "direction": 1, "pwm": 100, "confirmed": True,
+            })
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["ok"])
+        bridge.stop.assert_called_once()
+        bridge.arm.assert_called_once()
+        thread_class.return_value.start.assert_called_once()
+
+    def test_motor_jog_lock_blocks_only_selected_motor(self):
+        response = self.client.post("/api/motor_locks", json={
+            "motor": "biceps", "locked": True,
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["locks"]["biceps"])
+
+        blocked = self.client.post("/api/motor_jog/start", json={
+            "motor": "biceps", "direction": 1, "pwm": 100, "confirmed": True,
+        })
+        self.assertEqual(blocked.status_code, 409)
+        self.assertFalse(blocked.get_json()["ok"])
+
+        bridge = mock.Mock(safety_state="IDLE")
+        web.motor_bridge = bridge
+        web.motor_bridge_connected = True
+        with mock.patch.object(web, "connect_motor_bridge_if_needed", return_value=True), mock.patch.object(web.threading, "Thread") as thread_class:
+            allowed = self.client.post("/api/motor_jog/start", json={
+                "motor": "triceps", "direction": 1, "pwm": 100, "confirmed": True,
+            })
+        self.assertEqual(allowed.status_code, 200)
+        self.assertTrue(allowed.get_json()["ok"])
+        thread_class.return_value.start.assert_called_once()
+
+    def test_locking_active_jog_stops_motor_immediately(self):
+        bridge = mock.Mock()
+        web.motor_bridge = bridge
+        web.motor_bridge_connected = True
+        web.motor_test_running = True
+        web.motor_jog_active = True
+        web.motor_jog_motor = "deltoid"
+        previous_session = web.motor_jog_session
+        response = self.client.post("/api/motor_locks", json={
+            "motor": "deltoid", "locked": True,
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(web.motor_jog_active)
+        self.assertFalse(web.motor_test_running)
+        self.assertGreater(web.motor_jog_session, previous_session)
+        bridge.stop.assert_called_once()
+
+    def test_global_motor_lock_is_applied_at_final_esp32_gateway(self):
+        web.motor_channel_locks.update({
+            "biceps": True, "triceps": False, "deltoid": True,
+        })
+        locked = web.apply_motor_channel_locks(
+            web.MusclePWM(biceps=200, triceps=-100, deltoid=80)
+        )
+        self.assertEqual(
+            locked,
+            web.MusclePWM(biceps=0, triceps=-100, deltoid=0),
+        )
+        bridge = mock.Mock()
+        web.motor_bridge = bridge
+        sent = web.send_motor_pwm_with_locks(200, -100, 80)
+        self.assertEqual(sent, web.MusclePWM(biceps=0, triceps=-100, deltoid=0))
+        bridge.set_pwm.assert_called_once_with(0, -100, 0)
+
+    def test_global_biceps_direction_is_reversed_only_at_final_gateway(self):
+        logical = web.MusclePWM(biceps=40, triceps=-30, deltoid=20)
+        physical = web.apply_motor_direction_sign(logical)
+        self.assertEqual(
+            physical,
+            web.MusclePWM(biceps=-40, triceps=-30, deltoid=20),
+        )
+
+    def test_global_biceps_output_is_scaled_once_at_final_gateway(self):
+        bridge = mock.Mock()
+        web.motor_bridge = bridge
+        sent = web.send_motor_pwm_with_locks(100, -100, 100)
+        self.assertEqual(
+            sent,
+            web.MusclePWM(biceps=-80, triceps=-100, deltoid=100),
+        )
+        bridge.set_pwm.assert_called_once_with(-80, -100, 100)
+
+        negative = web.send_motor_pwm_with_locks(-75, 0, 0)
+        self.assertEqual(negative.biceps, 60)
+
+    def test_global_output_scale_endpoint_requires_all_outputs_stopped(self):
+        web.sensor.motor_enabled = True
+        response = self.client.post("/api/motor_output_scales", json={
+            "percentages": {"biceps": 50, "triceps": 90, "deltoid": 100},
+        })
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(response.get_json()["ok"])
+        self.assertEqual(web.MOTOR_OUTPUT_SCALE, [0.8, 1.0, 1.0])
+
+    def test_cable_settings_endpoint_rejects_active_motor(self):
+        web.sensor.motor_enabled = True
+        response = self.client.post("/api/cable_settings", json={
+            "settings": dict(web.CABLE_SETTINGS_DEFAULT),
+            "percentages": {"biceps": 80, "triceps": 100, "deltoid": 100},
+        })
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(web.muscle_allocator.triceps_release_ratio, 0.5)
+
+    def test_cable_settings_endpoint_applies_persists_and_reads_back(self):
+        bridge = mock.Mock()
+        web.motor_bridge = bridge
+        settings = dict(web.CABLE_SETTINGS_DEFAULT)
+        settings.update({
+            "antagonist_release_gain": 1.1,
+            "triceps_release_ratio": 0.35,
+            "biceps_release_ratio": 0.65,
+            "cable_return_gain": 1.25,
+            "cable_return_horizon": 0.8,
+            "cable_return_max_pwm": 75,
+            "shoulder_elbow_coupling_pwm": 40,
+            "shoulder_coupling_rewind_ratio": 1.5,
+            "wind_slew_rate": 900,
+            "release_slew_rate": 1500,
+            "following_triceps_wind_limit": 85,
+            "elbow_soft_landing_target": 92,
+            "elbow_soft_landing_zone": 20,
+            "elbow_soft_landing_min_ratio": 0.3,
+        })
+        with mock.patch.object(web, "save_cable_settings_config") as save_cable, \
+                mock.patch.object(web, "save_motor_output_scale_config") as save_scale:
+            response = self.client.post("/api/cable_settings", json={
+                "settings": settings,
+                "percentages": {"biceps": 60, "triceps": 90, "deltoid": 95},
+            })
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertEqual(body["settings"]["triceps_release_ratio"], 0.35)
+        self.assertEqual(body["settings"]["shoulder_coupling_rewind_ratio"], 1.5)
+        self.assertEqual(body["settings"]["elbow_soft_landing_target"], 92)
+        self.assertEqual(body["percentages"], {
+            "biceps": 60.0, "triceps": 90.0, "deltoid": 95.0,
+        })
+        self.assertEqual(web.muscle_allocator.biceps_release_ratio, 0.65)
+        self.assertEqual(web.muscle_allocator.cable_return_horizon, 0.8)
+        self.assertEqual(web.muscle_allocator.wind_slew_rate, 900)
+        self.assertEqual(web.muscle_allocator.elbow_soft_landing_min_ratio, 0.3)
+        self.assertEqual(web.FOLLOWING_TRICEPS_WIND_LIMIT, 85)
+        self.assertEqual(web.MOTOR_OUTPUT_SCALE, [0.6, 0.9, 0.95])
+        save_cable.assert_called_once()
+        save_scale.assert_called_once()
+        bridge.stop.assert_called_once()
+
+        web.muscle_allocator.enable_conditioning = False
+        try:
+            pwm = web.muscle_allocator.allocate(
+                "elbow", 100, motor_enabled=True, enforce_minimum=False,
+            )
+            self.assertEqual(pwm.biceps, 100)
+            self.assertEqual(pwm.triceps, -35)
+        finally:
+            web.muscle_allocator.enable_conditioning = True
+
+    def test_cable_settings_rejects_incomplete_values_without_partial_change(self):
+        before = web.current_cable_settings()
+        response = self.client.post("/api/cable_settings", json={
+            "settings": {"triceps_release_ratio": 0.2},
+            "percentages": {"biceps": 80, "triceps": 100, "deltoid": 100},
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(web.current_cable_settings(), before)
+
+    def test_global_output_scale_endpoint_clamps_saves_and_affects_gateway(self):
+        bridge = mock.Mock()
+        web.motor_bridge = bridge
+        with mock.patch.object(web, "save_motor_output_scale_config") as save_config:
+            response = self.client.post("/api/motor_output_scales", json={
+                "percentages": {"biceps": 5, "triceps": 75, "deltoid": 120},
+            })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json()["percentages"],
+            {"biceps": 10.0, "triceps": 75.0, "deltoid": 100.0},
+        )
+        self.assertEqual(web.MOTOR_OUTPUT_SCALE, [0.1, 0.75, 1.0])
+        save_config.assert_called_once()
+        bridge.stop.assert_called_once()
+
+        sent = web.send_motor_pwm_with_locks(100, 100, 100)
+        self.assertEqual(sent, web.MusclePWM(-10, 75, 100))
+
+    def test_global_output_scale_config_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = os.path.join(directory, "motor_output_scales.json")
+            with mock.patch.object(web, "MOTOR_OUTPUT_SCALE_CONFIG", config_path):
+                web.MOTOR_OUTPUT_SCALE[:] = [0.55, 0.85, 0.95]
+                web.save_motor_output_scale_config()
+                loaded = web.load_motor_output_scale_config()
+        self.assertEqual(loaded, [0.55, 0.85, 0.95])
+
+    def test_shoulder_coupling_biceps_component_bypasses_global_scale(self):
+        bridge = mock.Mock()
+        web.motor_bridge = bridge
+
+        raising = web.preserve_biceps_component_through_global_scale(
+            web.MusclePWM(-50, -50, 40),
+            component_pwm=-50,
+        )
+        sent_raising = web.send_motor_pwm_with_locks(
+            raising.biceps, raising.triceps, raising.deltoid
+        )
+        self.assertEqual(sent_raising, web.MusclePWM(50, -50, 40))
+
+        lowering = web.preserve_biceps_component_through_global_scale(
+            web.MusclePWM(50, 50, -40),
+            component_pwm=50,
+        )
+        sent_lowering = web.send_motor_pwm_with_locks(
+            lowering.biceps, lowering.triceps, lowering.deltoid
+        )
+        self.assertEqual(sent_lowering, web.MusclePWM(-50, 50, -40))
+
+    def test_global_motor_lock_blocks_pulse_test_for_selected_motor(self):
+        web.motor_channel_locks["triceps"] = True
+        response = self.client.post("/api/motor_test/pulse", json={
+            "motor": "triceps", "direction": 1, "confirmed_rig": True,
+        })
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(response.get_json()["ok"])
+
+    def test_motor_jog_arms_clamps_pwm_heartbeats_and_stops(self):
+        bridge = mock.Mock()
+        web.motor_bridge = bridge
+        web.motor_bridge_connected = True
+        with mock.patch.object(web, "connect_motor_bridge_if_needed", return_value=True), mock.patch.object(web.threading, "Thread") as thread_class:
+            response = self.client.post("/api/motor_jog/start", json={
+                "motor": "triceps", "direction": -1, "pwm": 999, "confirmed": True,
+            })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["pwm"], 200)
+        self.assertTrue(web.motor_jog_active)
+        self.assertTrue(web.motor_test_running)
+        bridge.stop.assert_called_once()
+        bridge.arm.assert_called_once()
+        thread_class.return_value.start.assert_called_once()
+
+        heartbeat = self.client.post("/api/motor_jog/heartbeat", json={})
+        self.assertEqual(heartbeat.status_code, 200)
+        stopped = self.client.post("/api/motor_jog/stop", json={})
+        self.assertEqual(stopped.status_code, 200)
+        self.assertFalse(web.motor_jog_active)
+        self.assertFalse(web.motor_test_running)
+
+    def test_imu_frame_guard_rejects_zero_reset_jump_and_nan(self):
+        health = {
+            "upper_arm": {"label": "上臂 IMU", "connected": True},
+            "forearm": {"label": "前臂 IMU", "connected": True},
+        }
+        valid, reason = web.validate_imu_frame(
+            {"elbow_angle_raw": 0.0, "shoulder_angle": 0.0},
+            {"elbow_angle_raw": 70.0, "shoulder_angle": 10.0},
+            health,
+        )
+        self.assertFalse(valid)
+        self.assertIn("跳變", reason)
+        valid, reason = web.validate_imu_frame(
+            {"elbow_angle_raw": float("nan"), "shoulder_angle": 10.0},
+            None,
+            health,
+        )
+        self.assertFalse(valid)
+        self.assertIn("非有限值", reason)
+
+    def test_imu_fault_blocks_enable_but_keeps_manual_jog_available(self):
+        web.imu_safety_fault_latched = True
+        web.imu_safety_fault_reason = "test disconnect"
+        denied = self.client.post(
+            "/api/set_motor", json={"enabled": True, "confirmed": True}
+        )
+        self.assertEqual(denied.status_code, 409)
+        self.assertFalse(web.sensor.motor_enabled)
+
+        bridge = mock.Mock()
+        web.motor_bridge = bridge
+        web.motor_bridge_connected = True
+        with mock.patch.object(web, "connect_motor_bridge_if_needed", return_value=True), mock.patch.object(web.threading, "Thread"):
+            jog = self.client.post("/api/motor_jog/start", json={
+                "motor": "biceps", "direction": 1, "pwm": 20, "confirmed": True,
+            })
+        self.assertEqual(jog.status_code, 200)
+
+    def test_imu_fault_never_auto_clears_and_requires_stable_confirmed_recovery(self):
+        web.imu_safety_fault_latched = True
+        web.imu_safety_fault_reason = "disconnect"
+        frame = {"elbow_angle_raw": 70.0, "shoulder_angle": 15.0}
+        for _ in range(web.IMU_RECOVERY_STABLE_SAMPLES_REQUIRED):
+            web.note_valid_imu_frame(frame)
+        self.assertTrue(web.imu_safety_fault_latched)
+        self.assertTrue(web.imu_recovery_ready)
+
+        unconfirmed = self.client.post("/api/imu_fault/clear", json={})
+        self.assertEqual(unconfirmed.status_code, 403)
+        self.assertTrue(web.imu_safety_fault_latched)
+
+        cleared = self.client.post(
+            "/api/imu_fault/clear", json={"confirmed": True}
+        )
+        self.assertEqual(cleared.status_code, 200)
+        self.assertFalse(web.imu_safety_fault_latched)
+        self.assertFalse(web.sensor.motor_enabled)
+
+    def test_motor_jog_worker_stops_on_missing_browser_heartbeat(self):
+        bridge = mock.Mock()
+        web.motor_bridge = bridge
+        web.motor_test_running = True
+        web.motor_jog_active = True
+        web.motor_jog_session += 1
+        session_id = web.motor_jog_session
+        web.motor_jog_last_heartbeat = 0.0
+        web.motor_jog_worker(session_id, "biceps", 1, 100)
+        self.assertFalse(web.motor_jog_active)
+        self.assertFalse(web.motor_test_running)
+        bridge.set_pwm.assert_not_called()
+        bridge.stop.assert_called_once()
+
+    def test_arm_failure_keeps_motor_stopped(self):
+        bridge = mock.Mock()
+        bridge.prepare_active.side_effect = RuntimeError("not armed")
+        web.motor_bridge = bridge
+        web.motor_bridge_connected = True
+        with mock.patch.object(web, "connect_motor_bridge_if_needed", return_value=True):
+            response = self.client.post(
+                "/api/set_motor", json={"enabled": True, "confirmed": True}
+            )
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(response.get_json()["ok"])
+        self.assertFalse(web.sensor.motor_enabled)
+        self.assertFalse(web.motor_arm_in_progress)
+
+    def test_rom_start_keeps_motor_disabled(self):
+        web.sensor.motor_enabled = True
+        response = self.client.post("/api/rom/start", json={"duration_seconds": 12})
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(web.sensor.motor_enabled)
+        self.assertEqual(response.get_json()["rom_calibration"]["expected_stage"], "elbow_flexion")
+        self.assertEqual(response.get_json()["rom_calibration"]["stage_duration_seconds"], 12.0)
+
+    def test_rom_stage_endpoint_starts_once_and_rejects_duplicate(self):
+        self.client.post("/api/rom/start", json={})
+        response = self.client.post("/api/rom/start_stage", json={})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["rom_calibration"]["current_stage"], "elbow_flexion")
+        duplicate = self.client.post("/api/rom/start_stage", json={})
+        self.assertEqual(duplicate.status_code, 400)
+        self.assertFalse(duplicate.get_json()["ok"])
+
+    def test_rom_apply_endpoint_updates_sensor_targets(self):
+        web.rom_calibration.results = {stage: {"recorded": True} for stage in web.rom_calibration.STAGE_ORDER}
+        web.rom_calibration.mapping = {
+            "elbow_axis": "roll",
+            "elbow_sign": 1,
+            "front_reference": (1.0, 0.0, 0.0),
+            "side_reference": (0.0, 0.0, 1.0),
+        }
+        web.rom_calibration.rom = {
+            "elbow_extension_target_deg": 5.0,
+            "elbow_flexion_target_deg": 95.0,
+            "shoulder_front_target_deg": 90.0,
+            "shoulder_side_target_deg": 80.0,
+        }
+        response = self.client.post("/api/rom/apply", json={})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["ok"])
+        self.assertEqual(web.sensor.trajectory_min_angle, 5.0)
+        self.assertEqual(web.sensor.trajectory_max_angle, 95.0)
+        self.assertEqual(web.sensor.fixed_target_angle, 95.0)
+
+    def test_disable_emergency_and_clear_buttons(self):
+        bridge = mock.Mock()
+        web.motor_bridge = bridge
+        web.motor_bridge_connected = True
+        web.sensor.motor_enabled = True
+        response = self.client.post("/api/set_motor", json={"enabled": False})
+        self.assertTrue(response.get_json()["ok"])
+        self.assertFalse(web.sensor.motor_enabled)
+        response = self.client.post("/api/emergency_stop", json={})
+        self.assertTrue(response.get_json()["ok"])
+        self.assertTrue(web.sensor.emergency_stop)
+        self.assertFalse(web.sensor.motor_enabled)
+        bridge.emergency_stop.assert_called_once()
+        with mock.patch.object(web, "connect_motor_bridge_if_needed", return_value=True):
+            response = self.client.post("/api/clear_emergency", json={})
+        self.assertTrue(response.get_json()["ok"])
+        self.assertFalse(web.sensor.emergency_stop)
+        bridge.clear_fault.assert_called_once()
+
+    def test_unconfirmed_estop_and_clear_keep_software_latched(self):
+        response = self.client.post("/api/emergency_stop", json={})
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(response.get_json()["ok"])
+        self.assertTrue(web.sensor.emergency_stop)
+
+        bridge = mock.Mock()
+        bridge.clear_fault.side_effect = RuntimeError("no acknowledgement")
+        web.motor_bridge = bridge
+        web.motor_bridge_connected = True
+        with mock.patch.object(web, "connect_motor_bridge_if_needed", return_value=True):
+            response = self.client.post("/api/clear_emergency", json={})
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(response.get_json()["ok"])
+        self.assertTrue(web.sensor.emergency_stop)
+
+    def test_disable_and_rom_start_do_not_clear_latched_estop(self):
+        web.sensor.emergency_stop = True
+        response = self.client.post("/api/set_motor", json={"enabled": False})
+        self.assertTrue(response.get_json()["ok"])
+        self.assertTrue(web.sensor.emergency_stop)
+        response = self.client.post("/api/rom/start", json={})
+        self.assertTrue(response.get_json()["ok"])
+        self.assertTrue(web.sensor.emergency_stop)
+
+    def test_recording_buttons_create_and_close_csv(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            response = self.client.post("/api/start_recording", json={
+                "participant_id": "BUTTON",
+                "session_name": "test",
+                "label": "controls",
+                "output_dir": temp_dir,
+            })
+            payload = response.get_json()
+            self.assertTrue(payload["ok"])
+            self.assertTrue(os.path.isfile(payload["csv_path"]))
+            duplicate = self.client.post("/api/start_recording", json={"output_dir": temp_dir})
+            self.assertFalse(duplicate.get_json()["ok"])
+            stopped = self.client.post("/api/stop_recording", json={})
+            self.assertTrue(stopped.get_json()["ok"])
+            self.assertFalse(web.recording)
+
+    def test_initialize_button_dispatches_worker_without_running_hardware(self):
+        with mock.patch.object(web.threading, "Thread") as thread_class:
+            response = self.client.post("/api/init", json={})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["ok"])
+        self.assertTrue(web.initializing)
+        thread_class.return_value.start.assert_called_once()
+
+    def test_old_validation_api_is_removed(self):
+        response = self.client.post("/api/validation/start", json={})
+        self.assertEqual(response.status_code, 404)
+
+    def test_server_accepts_shoulder_and_caps_lag_boost_at_255_pwm(self):
+        response = self.client.post("/api/apply_params", json={
+            "target_joint": "shoulder",
+            "target_mode": "fixed",
+            "fixed_target_angle": 55,
+            "output_limit": 999,
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(web.sensor.target_joint, "shoulder")
+        self.assertEqual(web.sensor.target_mode, "fixed")
+        self.assertEqual(web.sensor.fixed_target_angle, 55)
+        self.assertEqual(web.sensor.output_limit, 255)
+        self.assertEqual(response.get_json()["applied"]["fixed_target_angle"], 55)
+        self.assertEqual(response.get_json()["applied"]["output_limit"], 255)
+
+    def test_demo_rejects_non_sine_trajectory(self):
+        response = self.client.post("/api/apply_params", json={
+            "controller_mode": "trajectory_demo",
+            "target_mode": "step",
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(response.get_json()["ok"])
+        init_response = self.client.post("/api/init", json={
+            "controller_mode": "trajectory_demo",
+            "target_mode": "fixed",
+        })
+        self.assertEqual(init_response.status_code, 400)
+
+    def test_following_only_ignores_trajectory_and_demo_limit_caps_at_100(self):
+        following = self.client.post("/api/apply_params", json={
+            "controller_mode": "following_only",
+            "target_mode": "step",
+        })
+        self.assertEqual(following.status_code, 200)
+        self.assertEqual(web.sensor.controller_mode, "following_only")
+
+        demo = self.client.post("/api/apply_params", json={
+            "controller_mode": "trajectory_demo",
+            "target_mode": "sine",
+            "demo_output_limit": 999,
+        })
+        self.assertEqual(demo.status_code, 200)
+        self.assertEqual(web.sensor.demo_output_limit, 100.0)
+
+    def test_adrc_rejects_zero_input_gain(self):
+        response = self.client.post("/api/apply_params", json={
+            "controller_mode": "adrc",
+            "target_mode": "sine",
+            "adrc_input_gain": 0,
+        })
+        self.assertEqual(response.status_code, 400)
+
+    def test_ilc_rejects_non_sine_and_reset_requires_disabled_motor(self):
+        response = self.client.post("/api/apply_params", json={
+            "controller_mode": "ilc_pid",
+            "target_mode": "step",
+        })
+        self.assertEqual(response.status_code, 400)
+        ilc = mock.Mock()
+        ilc.status.return_value = {"enabled": True}
+        web.sensor.ilc = ilc
+        web.sensor.motor_enabled = True
+        blocked = self.client.post("/api/ilc/reset", json={})
+        self.assertEqual(blocked.status_code, 409)
+        web.sensor.motor_enabled = False
+        reset = self.client.post("/api/ilc/reset", json={})
+        self.assertEqual(reset.status_code, 200)
+        ilc.clear_learning.assert_called_once()
+
+    def test_demo_enable_resets_trajectory_after_arm(self):
+        bridge = mock.Mock()
+        web.motor_bridge = bridge
+        web.motor_bridge_connected = True
+        web.sensor.controller_mode = "trajectory_demo"
+        web.sensor.target_mode = "sine"
+        web.sensor.reset_trajectory = mock.Mock()
+        with mock.patch.object(web, "connect_motor_bridge_if_needed", return_value=True):
+            response = self.client.post(
+                "/api/set_motor", json={"enabled": True, "confirmed": True}
+            )
+        self.assertEqual(response.status_code, 200)
+        web.sensor.reset_trajectory.assert_called_once()
+
+    def test_frequency_start_requires_rig_confirmation(self):
+        response = self.client.post("/api/frequency/start", json={})
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(response.get_json()["ok"])
+
+    def test_frequency_start_arms_and_stop_disables_motor(self):
+        bridge = mock.Mock()
+        web.motor_bridge = bridge
+        web.motor_bridge_connected = True
+        web.sensor.target_joint = "elbow"
+        web.latest_frame = {"elbow_angle": 10.0, "shoulder_angle": 0.0}
+        with mock.patch.object(web, "connect_motor_bridge_if_needed", return_value=True):
+            response = self.client.post("/api/frequency/start", json={
+                "confirmed_rig": True,
+                "target_joint": "elbow",
+                "signal_type": "chirp",
+                "duration": 10,
+                "amplitude": 8,
+                "f_start": 0.1,
+                "f_end": 2.0,
+                "safe_min_angle": -10,
+                "safe_max_angle": 120,
+            })
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(web.sensor.motor_enabled)
+        self.assertEqual(web.frequency_session.state, "running")
+        bridge.stop.assert_called_once()
+        bridge.arm.assert_called_once()
+        stopped = self.client.post("/api/frequency/stop", json={})
+        self.assertEqual(stopped.status_code, 200)
+        self.assertFalse(web.sensor.motor_enabled)
+        self.assertEqual(web.frequency_session.state, "aborted")
+
+
+if __name__ == "__main__":
+    unittest.main()

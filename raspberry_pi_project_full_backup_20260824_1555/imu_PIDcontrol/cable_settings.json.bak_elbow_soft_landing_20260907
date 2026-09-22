@@ -1,0 +1,13 @@
+{
+  "antagonist_release_gain": 1.0,
+  "triceps_release_ratio": 0.5,
+  "biceps_release_ratio": 0.7,
+  "cable_return_gain": 1.0,
+  "cable_return_horizon": 1.25,
+  "cable_return_max_pwm": 70.0,
+  "shoulder_elbow_coupling_pwm": 50.0,
+  "shoulder_coupling_rewind_ratio": 0.5,
+  "wind_slew_rate": 2000.0,
+  "release_slew_rate": 2000.0,
+  "following_triceps_wind_limit": 100.0
+}

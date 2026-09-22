@@ -1,0 +1,15 @@
+# Python and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local editor and Codex workspace state
+.agents/
+.codex/
+.codex_*/
+.pi_sync/
+
+# Generated local build and temporary files
+.arduino_build/
+tmp/
+~$*.docx
